@@ -6,18 +6,19 @@ use std::{
     path::Path,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 
 use bevy::{
+    image::{ImageSampler, ImageSamplerDescriptor},
     pbr::{ExtendedMaterial, MaterialExtension},
+    platform::collections::HashMap,
     prelude::*,
     render::{
         render_asset::RenderAssetUsages,
         render_resource::{Extent3d, TextureDimension, TextureFormat},
-        texture::{ImageSampler, ImageSamplerDescriptor},
     },
     tasks::{AsyncComputeTaskPool, Task},
-    utils::HashMap,
+    
 };
 use futures_lite::future;
 use image::{imageops::FilterType, DynamicImage, ImageBuffer};
@@ -153,43 +154,36 @@ impl Plugin for MipmapGeneratorDebugTextPlugin {
 #[cfg(feature = "debug_text")]
 fn init_loading_text(mut commands: Commands) {
     commands
-        .spawn(NodeBundle {
-            style: Style {
+        .spawn((
+            Node {
                 left: Val::Px(1.5),
                 top: Val::Px(1.5),
                 ..default()
             },
-            z_index: ZIndex::Global(-1),
-            ..default()
-        })
+            GlobalZIndex(-1),
+        ))
         .with_children(|parent| {
             parent.spawn((
-                TextBundle::from_sections(vec![TextSection {
-                    style: TextStyle {
-                        font_size: 18.0,
-                        color: Color::BLACK,
-                        ..default()
-                    },
+                Text::new(""),
+                TextFont {
+                    font_size: 18.0,
                     ..default()
-                }]),
+                },
+                TextColor(Color::BLACK),
                 MipmapGeneratorDebugLoadingText,
             ));
         });
-    commands
-        .spawn(NodeBundle::default())
-        .with_children(|parent| {
-            parent.spawn((
-                TextBundle::from_sections(vec![TextSection {
-                    style: TextStyle {
-                        font_size: 18.0,
-                        color: Color::WHITE,
-                        ..default()
-                    },
-                    ..default()
-                }]),
-                MipmapGeneratorDebugLoadingText,
-            ));
-        });
+    commands.spawn(Node::default()).with_children(|parent| {
+        parent.spawn((
+            Text::new(""),
+            TextFont {
+                font_size: 18.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            MipmapGeneratorDebugLoadingText,
+        ));
+    });
 }
 
 #[cfg(feature = "debug_text")]
@@ -197,12 +191,12 @@ fn init_loading_text(mut commands: Commands) {
 pub struct MipmapGeneratorDebugLoadingText;
 #[cfg(feature = "debug_text")]
 fn update_loading_text(
-    mut texts: Query<&mut Text, With<MipmapGeneratorDebugLoadingText>>,
+    mut texts: Query<(&mut Text, &mut TextColor), With<MipmapGeneratorDebugLoadingText>>,
     progress: Res<MipmapGenerationProgress>,
     time: Res<Time>,
 ) {
-    for mut text in &mut texts {
-        text.sections[0].value = format!(
+    for (mut text, mut color) in &mut texts {
+        text.0 = format!(
             "bevy_mod_mipmap_generator progress: {} / {}\n{}",
             progress.processed,
             progress.total,
@@ -216,11 +210,11 @@ fn update_loading_text(
             }
         );
         let alpha = if progress.processed == progress.total {
-            (text.sections[0].style.color.alpha() - time.delta_seconds() * 0.25).max(0.0)
+            (color.0.alpha() - time.delta_secs() * 0.25).max(0.0)
         } else {
             1.0
         };
-        text.sections[0].style.color.set_alpha(alpha);
+        color.0.set_alpha(alpha);
     }
 }
 
@@ -235,12 +229,15 @@ pub struct MipmapTasks<M: Material + GetImages>(
     HashMap<Handle<Image>, (Task<TaskData>, Vec<Handle<M>>)>,
 );
 
+#[derive(Component, Clone, Debug, Deref, DerefMut, Reflect, PartialEq, Eq)]
+pub struct MaterialHandle<M: Material + GetImages>(pub Handle<M>);
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_mipmaps<M: Material + GetImages>(
     mut commands: Commands,
     mut material_events: EventReader<AssetEvent<M>>,
     mut materials: ResMut<Assets<M>>,
-    no_mipmap: Query<&Handle<M>, With<NoMipmapGeneration>>,
+    no_mipmap: Query<&MaterialHandle<M>, With<NoMipmapGeneration>>,
     mut images: ResMut<Assets<Image>>,
     default_sampler: Res<DefaultSampler>,
     mut progress: ResMut<MipmapGenerationProgress>,
@@ -430,7 +427,7 @@ pub fn generate_mips_texture(
                 image.texture_descriptor.view_formats = &[];
             }
 
-            image.data = new_image_data;
+            image.data = Some(new_image_data);
             Ok(())
         }
         Err(e) => Err(e),
@@ -568,9 +565,13 @@ pub fn extract_mip_level(image: &Image, mip_level: u32) -> anyhow::Result<Image>
         height: height as u32,
         depth_or_array_layers: 1,
     };
+    
 
     Ok(Image {
-        data: image.data[byte_offset..byte_offset + (width * block_size * height)].to_vec(),
+        data: match &image.data {
+            Some(data) => Some(data[byte_offset..byte_offset + (width * block_size * height)].to_vec()),
+            None => None,
+        },
         texture_descriptor: new_descriptor,
         sampler: image.sampler.clone(),
         texture_view_descriptor: image.texture_view_descriptor.clone(),
@@ -623,7 +624,7 @@ impl GetImages for StandardMaterial {
 
 impl<T: GetImages + MaterialExtension> GetImages for ExtendedMaterial<StandardMaterial, T> {
     fn get_images(&self) -> Vec<&Handle<Image>> {
-        vec![
+        let mut images: Vec<&Handle<Image>> = vec![
             &self.base.base_color_texture,
             &self.base.emissive_texture,
             &self.base.metallic_roughness_texture,
@@ -632,35 +633,37 @@ impl<T: GetImages + MaterialExtension> GetImages for ExtendedMaterial<StandardMa
         ]
         .into_iter()
         .flatten()
-        .chain(self.extension.get_images())
-        .collect()
+        .collect();
+        images.append(&mut self.extension.get_images());
+        images
     }
 }
 
 pub fn try_into_dynamic(image: Image) -> anyhow::Result<DynamicImage> {
+    let data = image.data.context("Image data is None")?;
     match image.texture_descriptor.format {
         TextureFormat::R8Unorm => ImageBuffer::from_raw(
             image.texture_descriptor.size.width,
             image.texture_descriptor.size.height,
-            image.data,
+            data,
         )
         .map(DynamicImage::ImageLuma8),
         TextureFormat::Rg8Unorm => ImageBuffer::from_raw(
             image.texture_descriptor.size.width,
             image.texture_descriptor.size.height,
-            image.data,
+            data,
         )
         .map(DynamicImage::ImageLumaA8),
         TextureFormat::Rgba8UnormSrgb => ImageBuffer::from_raw(
             image.texture_descriptor.size.width,
             image.texture_descriptor.size.height,
-            image.data,
+            data,
         )
         .map(DynamicImage::ImageRgba8),
         TextureFormat::Rgba8Unorm => ImageBuffer::from_raw(
             image.texture_descriptor.size.width,
             image.texture_descriptor.size.height,
-            image.data,
+            data,
         )
         .map(DynamicImage::ImageRgba8),
         // Throw and error if conversion isn't supported
