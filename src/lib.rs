@@ -21,7 +21,8 @@ use bevy::{
     
 };
 use futures_lite::future;
-use image::{imageops::FilterType, DynamicImage, ImageBuffer};
+use image::{DynamicImage, ImageBuffer};
+pub use image::imageops::FilterType;
 
 #[derive(Resource, Deref)]
 pub struct DefaultSampler(ImageSamplerDescriptor);
